@@ -1,81 +1,79 @@
 import requests
-import feedparser
 import os
+import json
 
-# ---------- 配置 ----------
 SENDKEY = os.environ["SENDKEY"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 DEEPSEEK_BASE_URL = os.environ["DEEPSEEK_BASE_URL"]
 
-# 国际可访问的 RSS 源（在美国服务器上测试可用）
-RSS_SOURCES = [
-    {"name": "BBC中文网", "url": "http://feeds.bbci.co.uk/zhongwen/simp/rss.xml"},
-    {"name": "路透社中文", "url": "http://cn.reuters.com/rssFeed/topNews"},
-    {"name": "德国之声中文", "url": "https://rss.dw.com/rdf/rss-zh-chs"},
-    {"name": "纽约时报中文", "url": "https://cn.nytimes.com/rss/"},
-]
-
 def fetch_news():
-    all_news = []
-    for source in RSS_SOURCES:
-        try:
-            feed = feedparser.parse(source["url"])
-            if feed.entries:
-                for entry in feed.entries[:2]:  # 每个源取前2条
-                    title = entry.title
-                    link = entry.link
-                    all_news.append(f"{source['name']}：{title}\n{link}")
-            else:
-                print(f"无条目: {source['name']}")
-        except Exception as e:
-            print(f"抓取失败 {source['name']}: {e}")
-    # 去重，最多取前8条
-    unique = list(dict.fromkeys(all_news))
-    return unique[:8]
+    """从国内公开 API 获取热榜"""
+    news_list = []
+    
+    # 1. 微博热搜（不需要 cookie）
+    try:
+        url = "https://weibo.com/ajax/side/hotSearch"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+        if "data" in data and "realtime" in data["data"]:
+            for item in data["data"]["realtime"][:5]:
+                title = item.get("word", "")
+                news_list.append(f"微博热搜：{title}\nhttps://s.weibo.com/weibo?q={title}")
+    except Exception as e:
+        print(f"微博失败: {e}")
+    
+    # 2. 知乎热榜（公开接口）
+    try:
+        url = "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=5"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+        for item in data.get("data", []):
+            title = item.get("target", {}).get("title", "")
+            if title:
+                news_list.append(f"知乎热榜：{title}\nhttps://www.zhihu.com/question/{item.get('target',{}).get('id')}")
+    except Exception as e:
+        print(f"知乎失败: {e}")
+    
+    # 3. 百度热搜（备用）
+    try:
+        url = "https://top.baidu.com/board?tab=realtime"
+        # 百度需要解析HTML，这里简化，改用另一个API
+        resp = requests.get("https://api.qingyunke.com/hot?type=baidu", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("data", [])[:3]:
+                title = item.get("title", "")
+                news_list.append(f"百度热搜：{title}\nhttps://www.baidu.com/s?wd={title}")
+    except Exception as e:
+        print(f"百度失败: {e}")
+    
+    # 去重
+    return list(dict.fromkeys(news_list))[:8]
 
 def ai_summarize(news_list):
     if not news_list:
-        # 如果没有新闻，返回一个默认消息
-        return "今日没有抓到新闻，可能是源站临时不可用。稍后会自动重试。"
+        return "今日没有抓到新闻，可能是接口临时失效。"
     news_text = "\n\n".join(news_list)
-    prompt = f"""请用100字左右总结以下新闻的要点，语言简洁、适合早晨快速阅读，最后加一句鼓励的话。
-
-新闻列表：
-{news_text}
-"""
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False
-    }
+    prompt = f"请用100字左右总结以下新闻要点，简洁适合早读，最后一句鼓励：\n{news_text}"
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "stream": False}
     try:
-        resp = requests.post(f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
-                             headers=headers, json=payload, timeout=30)
+        resp = requests.post(f"{DEEPSEEK_BASE_URL}/v1/chat/completions", headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             return resp.json()["choices"][0]["message"]["content"]
         else:
-            return f"AI摘要失败（{resp.status_code}），原始新闻：\n{news_text}"
+            return f"AI失败({resp.status_code})，原始新闻：\n{news_text}"
     except Exception as e:
-        return f"AI摘要异常：{str(e)}\n原始新闻：\n{news_text}"
+        return f"AI异常：{e}\n{news_text}"
 
 def send_wechat(content):
     url = f"https://sctapi.ftqq.com/{SENDKEY}.send"
-    data = {
-        "title": "🤖 你的AI早报",
-        "desp": content
-    }
-    requests.post(url, data=data)
+    requests.post(url, data={"title": "🤖 你的AI早报", "desp": content})
 
 if __name__ == "__main__":
-    print("抓取新闻中...")
-    raw_news = fetch_news()
-    print(f"抓取到 {len(raw_news)} 条新闻")
-    print("AI生成摘要中...")
-    summary = ai_summarize(raw_news)
-    print("推送到微信...")
+    print("抓取国内热榜...")
+    news = fetch_news()
+    print(f"抓到 {len(news)} 条")
+    summary = ai_summarize(news)
     send_wechat(summary)
-    print("完成！")
+    print("完成")
